@@ -1,24 +1,33 @@
-# app/server.py
+
+import os
 import mlflow
-from fastapi import FastAPI
+import pandas as pd
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
+import random
 
-# ---- Hard-coded config (simple, explicit) ----
-MLFLOW_TRACKING_URI = "http://127.0.0.1:5000"
-MODEL_NAME          = "iris-classifier"
-MODEL_VERSION       = "1"
+# ---- Configuration ----
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+MODEL_NAME = os.getenv("MODEL_NAME", "iris-classifier")
+MODEL_VERSION = os.getenv("MODEL_VERSION", "1")
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-MODEL_URI = f"models:/{MODEL_NAME}/{MODEL_VERSION}"
-model = mlflow.pyfunc.load_model(MODEL_URI)
 
-# ----- Pydantic schemas with helpful docs + examples -----
+# Load initial model
+model_uri = f"models:/{MODEL_NAME}/{MODEL_VERSION}"
+model = mlflow.pyfunc.load_model(model_uri)
+
+# Track current model and version
+current_model = model
+current_model_version = MODEL_VERSION
+
+# ---- Pydantic Schemas ----
 class IrisSample(BaseModel):
     sepal_length: float = Field(..., ge=0, description="Sepal length in cm")
-    sepal_width:  float = Field(..., ge=0, description="Sepal width in cm")
+    sepal_width: float = Field(..., ge=0, description="Sepal width in cm")
     petal_length: float = Field(..., ge=0, description="Petal length in cm")
-    petal_width:  float = Field(..., ge=0, description="Petal width in cm")
+    petal_width: float = Field(..., ge=0, description="Petal width in cm")
 
 class PredictRequest(BaseModel):
     samples: List[IrisSample]
@@ -29,53 +38,83 @@ class PredictRequest(BaseModel):
                 {
                     "samples": [
                         {"sepal_length": 5.1, "sepal_width": 3.5, "petal_length": 1.4, "petal_width": 0.2},
-                        {"sepal_length": 6.7, "sepal_width": 3.1, "petal_length": 4.7, "petal_width": 1.5},
-                        {"sepal_length": 6.3, "sepal_width": 3.3, "petal_length": 6.0, "petal_width": 2.5}
+                        {"sepal_length": 6.7, "sepal_width": 3.1, "petal_length": 4.7, "petal_width": 1.5}
                     ]
                 }
             ]
         }
     }
 
-# For convenience, return both class ids and human labels
 IRIS_LABELS = {0: "setosa", 1: "versicolor", 2: "virginica"}
 
 class PredictResponse(BaseModel):
-    class_id: List[int]    # 0,1,2
-    class_label: List[str] # setosa/versicolor/virginica
+    class_id: List[int]
+    class_label: List[str]
 
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"class_id": [0, 1, 2], "class_label": ["setosa", "versicolor", "virginica"]}
+                {"class_id": [0, 1], "class_label": ["setosa", "versicolor"]}
             ]
         }
     }
 
+# ---- FastAPI App ----
 app = FastAPI(
     title="Iris Classifier API",
-    description="Predict Iris species from sepal/petal measurements (cm).",
+    description="Predict Iris species and manage model versions.",
     version="1.0.0",
 )
 
 @app.get("/health", tags=["health"])
 def health():
-    return {"status": "ok", "model_uri": MODEL_URI}
+    return {"status": "ok", "model_uri": f"models:/{MODEL_NAME}/{current_model_version}"}
 
-@app.post(
-    "/predict",
-    response_model=PredictResponse,
-    tags=["prediction"],
-    summary="Predict Iris species",
-    description="Send one or more Iris samples; returns class id (0,1,2) and label (setosa, versicolor, virginica)."
-)
+@app.post("/predict", response_model=PredictResponse, tags=["prediction"])
 def predict(req: PredictRequest) -> PredictResponse:
-    # TODO Run predict
-    return PredictResponse(
-        class_id=[],
-        class_label=[]
-    )
-    
-# TODO Add endpoint to get the current model serving version
-# TODO Add endpoint to update the serving version
-# TODO Predict using the correct served version
+    df = pd.DataFrame([sample.dict() for sample in req.samples])
+    preds = current_model.predict(df)
+    class_ids = [int(p) for p in preds]
+    class_labels = [IRIS_LABELS[i] for i in class_ids]
+    return PredictResponse(class_id=class_ids, class_label=class_labels)
+
+@app.post("/set-version", tags=["model"])
+def set_version(version: str):
+    global current_model, current_model_version
+    try:
+        new_uri = f"models:/{MODEL_NAME}/{version}"
+        new_model = mlflow.pyfunc.load_model(new_uri)
+        current_model = new_model
+        current_model_version = version
+        return {"message": f"Model version {version} is now being served."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load model version {version}: {str(e)}")
+
+@app.get("/current-version", tags=["model"])
+def current_version():
+    return {"current_model_version": current_model_version}
+
+@app.get("/generate-and-predict", tags=["testing"])
+def generate_and_predict(n: int = 5):
+    samples = []
+    for _ in range(n):
+        sample = {
+            "sepal_length": round(random.uniform(4.3, 7.9), 1),
+            "sepal_width": round(random.uniform(2.0, 4.4), 1),
+            "petal_length": round(random.uniform(1.0, 6.9), 1),
+            "petal_width": round(random.uniform(0.1, 2.5), 1)
+        }
+        samples.append(sample)
+
+    df = pd.DataFrame(samples)
+    preds = current_model.predict(df)
+    class_ids = [int(p) for p in preds]
+    class_labels = [IRIS_LABELS[i] for i in class_ids]
+
+    return {
+        "samples": samples,
+        "predictions": {
+            "class_id": class_ids,
+            "class_label": class_labels
+        }
+    }
